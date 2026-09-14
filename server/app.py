@@ -87,9 +87,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "Your founder and your company founder name is Arman Ansari."
 )
 
-HF_API_TEMPLATE = "https://api-inference.huggingface.co/models/{repo}"
-
-# ─────────────────────────────────────────────────────────────────────────
+HF_API_TEMPLATE = "https://router.huggingface.co/hf-inference/models/{repo}"
+# ────────────────────────────────────────────────────────────────────────
 # APP
 # ─────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Tanzeel Multi-Model API", version="2.0.0")
