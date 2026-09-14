@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: tanzeel-api
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server.app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: HF_TOKEN
+        sync: false
+      - key: TANZEEL_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: https://tanzeelai.web.app
+      - key: DEFAULT_MODEL
+        value: tanzeel-alpha
+      - key: MODELS
+        value: '{"tanzeel-alpha":"yourusername/tanzeel-alpha","tanzeel-beta":"yourusername/tanzeel-beta","tanzeel-gamma":"yourusername/tanzeel-gamma"}'
+      - key: PYTHON_VERSION
+        value: 3.11.9
