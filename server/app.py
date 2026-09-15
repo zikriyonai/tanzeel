@@ -60,8 +60,9 @@ ALLOWED_ORIGINS = [
 ]
 
 # 🔥 FIXED: Point to the preview model you just uploaded
+# Option 1 — Llama 3.1 8B (Recommended — fast + reliable)
 DEFAULT_MODELS = {
-    "tanzeel-preview": "Qwen/Qwen2.5-7B-Instruct",   # 🔥 temporary — HF Inference API support karta hai
+    "tanzeel-preview": "meta-llama/Meta-Llama-3.1-8B-Instruct",
 }
 
 
