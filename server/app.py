@@ -61,10 +61,7 @@ ALLOWED_ORIGINS = [
 
 # 🔥 FIXED: Point to the preview model you just uploaded
 DEFAULT_MODELS = {
-    "tanzeel-preview": "zeaipc/tanzeel-preview",
-    # Add future models here:
-    # "tanzeel-intelligence": "zeaipc/tanzeel-intelligence",
-    # "tanzeel-beta": "zeaipc/tanzeel-beta",
+    "tanzeel-preview": "Qwen/Qwen2.5-7B-Instruct",   # 🔥 temporary — HF Inference API support karta hai
 }
 
 
