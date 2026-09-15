@@ -1,145 +1,135 @@
 """
-Tanzeel Intelligence — Multi-Model Proxy Server.
+Tanzeel Intelligence FastAPI proxy.
 
-ONE URL, MANY MODELS.
-Frontend always calls the same endpoint; server routes to the right
-Hugging Face model based on the "model" field in the request.
+Routes requests to Hugging Face Inference Providers using the current
+OpenAI-compatible router endpoint. Sessions are bounded with TTL/LRU cleanup.
 
-Architecture:
-    [Frontend] → [This server] → [HF Model: tanzeel-alpha]
-                              → [HF Model: tanzeel-beta]
-                              → [HF Model: tanzeel-gamma]
-                              → [HF Model: any-future-model]
-
-Environment variables (Render dashboard):
-    HF_TOKEN          = hf_xxxxxxxxxx
-    TANZEEL_API_KEY   = tz_xxxxxxxxxxxxx
-    ALLOWED_ORIGINS   = https://tanzeelai.web.app
-    MODELS            = JSON map of model_name → HF repo id
-                        (see default below)
-
-TWO FIXES vs. the earlier draft of this file:
-
-1. SYSTEM PROMPTS ARE HONEST. The base model isn't advertised anywhere
-   in the UI or led with in casual conversation — normal, standard
-   product branding. But the prompts no longer instruct the model to
-   deny/deflect if a user directly and sincerely asks what the
-   underlying model is. Apache 2.0 (Qwen's license) makes not
-   advertising the base model legally fine; it doesn't make instructing
-   active concealment when asked ethically fine — those are different
-   things. If you change these prompts, please keep that distinction.
-
-2. PROPER CHAT TEMPLATING. The earlier version hand-built a prompt
-   string using `<|system|>`/`<|user|>` tags and hit HF's raw
-   text-generation endpoint. Those tags aren't what Qwen was actually
-   trained on (Qwen uses ChatML: `<|im_start|>role ... <|im_end|>`) —
-   sending the wrong format can silently degrade output quality. This
-   version sends a proper `messages` list to HF's OpenAI-compatible
-   `/v1/chat/completions` endpoint instead, which applies the correct
-   chat template for whichever model is being called automatically —
-   correct regardless of what chat format the underlying model actually
-   uses, and one less thing to keep in sync by hand.
+Deploy on Render. Used by:
+- https://tanzeelai.web.app  (production)
+- http://localhost:7700     (local dev)
 """
 
-import os
+from __future__ import annotations
+
 import json
-import uuid
+import os
 import time
-import requests
+import uuid
+from collections import OrderedDict
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Header
+import requests
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+# ─────────────────────────────────────────────────────────────────────────
+# SYSTEM PROMPT
+# ─────────────────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are Tanzeel Intelligence, an AI assistant created by ZEAIPC (Zikr-e-Ameen Innovations & Programming Corporation), founded by Arman Ansari.
+
+Rules:
+- Your name is "Tanzeel Intelligence". Never claim to be, or hint at being, any other model or AI system.
+- Reply in the user's language: Hindi, English, or Hinglish. Match their tone and formality.
+- Be helpful, warm, and direct. Use Markdown for formatting when useful.
+- If asked what model or technology you are based on, respond politely: "Main Tanzeel Intelligence hoon, ZEAIPC ne banaya hai. Meri architecture aur training details proprietary hain."
+- Do not name, reference, or imply any third-party AI company, model, or architecture.
+- If pressed repeatedly, stay polite but consistent: you are Tanzeel Intelligence, made by ZEAIPC.
+"""
 
 # ─────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 TANZEEL_API_KEY = os.getenv("TANZEEL_API_KEY", "").strip()
-ALLOWED_ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS", "https://tanzeelai.web.app"
-).split(",")
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower()
+REQUIRE_API_KEY = os.getenv("REQUIRE_API_KEY", "false").strip().lower() == "true"
 
-# ── Model registry ───────────────────────────────────────────────────────
-# Map of PUBLIC name (what frontend sends) → HF repo id (where it's hosted).
-# Add new models here — no other code change needed.
-#
-# NOTE: "tanzeel-beta" below points at "zeaipc/tanzeel-beta" — the earlier
-# draft had this pointing at "zeaipc/tanzeel-delta", which looked like a
-# copy-paste typo (the public name and repo name didn't match any other
-# entry's pattern). Fixed here; change it back if that was intentional.
-#
-# You can override this on Render by setting the MODELS env var to a JSON
-# string with the same shape.
+# 🔥 FIXED: Allow both production (tanzeelai.web.app) and local dev (localhost:7700)
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "ALLOWED_ORIGINS",
+        "https://tanzeelai.web.app,"
+        "http://localhost:7700,"
+        "http://localhost:3000,"
+        "http://localhost:5173,"
+        "http://127.0.0.1:7700"
+    ).split(",")
+    if origin.strip()
+]
+
+# 🔥 FIXED: Point to the preview model you just uploaded
 DEFAULT_MODELS = {
-    "tanzeel-alpha": "zeaipc/tanzeel-alpha",
-    "tanzeel-beta":  "zeaipc/tanzeel-beta",
-    "tanzeel-gamma": "zeaipc/tanzeel-gamma",
+    "tanzeel-preview": "zeaipc/tanzeel-preview",
+    # Add future models here:
+    # "tanzeel-intelligence": "zeaipc/tanzeel-intelligence",
+    # "tanzeel-beta": "zeaipc/tanzeel-beta",
 }
 
-def load_models() -> dict:
+
+def load_models() -> dict[str, str]:
+    """Load models from MODELS env var (JSON) or fall back to defaults."""
     raw = os.getenv("MODELS", "").strip()
-    if raw:
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict) and parsed:
-                return parsed
-        except json.JSONDecodeError:
-            print("[warn] MODELS env var is not valid JSON — using defaults.")
-    return DEFAULT_MODELS
+    if not raw:
+        return DEFAULT_MODELS.copy()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("MODELS must be valid JSON.") from exc
+    if not isinstance(parsed, dict) or not parsed:
+        raise RuntimeError("MODELS must be a non-empty JSON object.")
+    if not all(
+        isinstance(k, str) and isinstance(v, str) and k and v
+        for k, v in parsed.items()
+    ):
+        raise RuntimeError("MODELS must map non-empty model names to HF repo IDs.")
+    return parsed
 
-MODELS: dict[str, str] = load_models()
-DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "").strip() or next(iter(MODELS))
 
-# Per-model system prompts — persona differs per model, but the identity/
-# honesty rules are shared (see SHARED_IDENTITY_RULES below).
-SHARED_IDENTITY_RULES = (
-    "You are part of the Tanzeel Intelligence family of models, created by "
-    "ZEAIPC (Zikr-e-Ameen Innovations & Programming Corporation), founded by "
-    "Arman Ansari. If asked who made you: \"ZEAIPC, founded by Arman Ansari.\" "
-    "If asked directly and sincerely what your underlying/base model is, answer "
-    "honestly rather than denying or deflecting — only avoid bringing it up "
-    "unprompted, the same way most products built on a base model don't lead "
-    "with that detail in casual use. Your fine-tuning, training data, and "
-    "adaptation recipe are ZEAIPC's own proprietary work."
-)
+MODELS = load_models()
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "").strip() or next(iter(MODELS))
 
-SYSTEM_PROMPTS = {
-    "tanzeel-alpha": (
-        f"{SHARED_IDENTITY_RULES}\n\n"
-        "You are Tanzeel Alpha: a friendly, conversational Hinglish assistant. "
-        "Reply in the user's language (Hindi, English, or Hinglish), matching their tone."
-    ),
-    "tanzeel-beta": (
-        f"{SHARED_IDENTITY_RULES}\n\n"
-        "You are Tanzeel Beta: analytical and precise. Be structured and technical "
-        "where it helps, while staying clear and easy to follow."
-    ),
-    "tanzeel-gamma": (
-        f"{SHARED_IDENTITY_RULES}\n\n"
-        "You are Tanzeel Gamma: creative and expressive. Be imaginative and engaging "
-        "while staying genuinely helpful."
-    ),
+if DEFAULT_MODEL not in MODELS:
+    raise RuntimeError(
+        f"DEFAULT_MODEL={DEFAULT_MODEL!r} is not present in MODELS."
+    )
+
+# Production checks
+if ENVIRONMENT == "production" and not HF_TOKEN:
+    raise RuntimeError("HF_TOKEN must be configured in production.")
+
+if ENVIRONMENT == "production" and REQUIRE_API_KEY and not TANZEEL_API_KEY:
+    raise RuntimeError(
+        "TANZEEL_API_KEY must be configured when REQUIRE_API_KEY=true."
+    )
+
+# 🔥 HF Router (current, non-deprecated endpoint)
+HF_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
+
+MODEL_PROMPTS = {
+    "tanzeel-preview": SYSTEM_PROMPT,
+    "tanzeel-intelligence": SYSTEM_PROMPT,
 }
-DEFAULT_SYSTEM_PROMPT = SHARED_IDENTITY_RULES
 
-HF_CHAT_API_TEMPLATE = "https://router.huggingface.co/hf-inference/models/{repo}/v1/chat/completions"
-# ────────────────────────────────────────────────────────────────────────
-# APP
 # ─────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Tanzeel Multi-Model API", version="2.1.0")
+# FASTAPI APP
+# ─────────────────────────────────────────────────────────────────────────
+app = FastAPI(title="Tanzeel Intelligence API", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
 )
 
-SESSIONS: dict[str, list[dict]] = {}
-MAX_SESSION_TURNS = 10
+# Bounded in-memory session store.
+MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", "5000"))
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
+MAX_SESSION_TURNS = int(os.getenv("MAX_SESSION_TURNS", "10"))
+SESSIONS: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -147,63 +137,77 @@ MAX_SESSION_TURNS = 10
 # ─────────────────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=8000)
-    model: Optional[str] = None          # ← which Tanzeel variant?
-    session_id: Optional[str] = None
+    model: Optional[str] = None
+    session_id: Optional[str] = Field(default=None, max_length=128)
     max_new_tokens: int = Field(default=500, ge=1, le=2048)
-    temperature: float = Field(default=0.7, gt=0.0, le=2.0)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     top_p: float = Field(default=0.9, gt=0.0, le=1.0)
-    allow_web_fallback: bool = True
-    api_key: Optional[str] = None        # legacy fallback (header preferred)
+    allow_web_fallback: bool = False
 
 
 class ChatResponse(BaseModel):
     reply: str
     session_id: str
-    model: str                # resolved public name
-    source: str               # "tanzeel" or "web_search"
+    model: str
+    source: str
 
 
 class ResetRequest(BaseModel):
-    session_id: str
+    session_id: str = Field(..., min_length=1, max_length=128)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# SESSION MANAGEMENT
+# ─────────────────────────────────────────────────────────────────────────
+def cleanup_sessions() -> None:
+    now = time.time()
+    expired = [
+        key for key, (last_seen, _) in SESSIONS.items()
+        if now - last_seen > SESSION_TTL_SECONDS
+    ]
+    for key in expired:
+        SESSIONS.pop(key, None)
+
+    while len(SESSIONS) > MAX_SESSIONS:
+        SESSIONS.popitem(last=False)
+
+
+def get_session(key: str) -> list[dict]:
+    cleanup_sessions()
+    item = SESSIONS.get(key)
+    if item is None:
+        return []
+    _, history = item
+    SESSIONS.move_to_end(key)
+    return list(history)
+
+
+def put_session(key: str, history: list[dict]) -> None:
+    cleanup_sessions()
+    SESSIONS[key] = (time.time(), history[-(MAX_SESSION_TURNS * 2):])
+    SESSIONS.move_to_end(key)
+    cleanup_sessions()
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────
 def resolve_model(requested: Optional[str]) -> tuple[str, str]:
-    """Return (public_name, hf_repo). Fall back to default if unknown."""
-    if not requested:
-        requested = DEFAULT_MODEL
-    if requested not in MODELS:
-        # Unknown model — fall back to default (don't 400; be forgiving)
-        return DEFAULT_MODEL, MODELS[DEFAULT_MODEL]
-    return requested, MODELS[requested]
-
-
-def web_search_fallback(query: str) -> Optional[str]:
-    try:
-        resp = requests.get(
-            "https://api.duckduckgo.com/",
-            params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
-            timeout=5,
+    public_name = requested or DEFAULT_MODEL
+    if public_name not in MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model '{public_name}'. Available: {list(MODELS)}",
         )
-        data = resp.json()
-        text = data.get("AbstractText") or ""
-        if not text and data.get("RelatedTopics"):
-            first = data["RelatedTopics"][0]
-            text = first.get("Text", "") if isinstance(first, dict) else ""
-        return text.strip() or None
-    except Exception:
-        return None
+    return public_name, MODELS[public_name]
 
 
-def looks_low_quality(reply: str) -> bool:
-    if not reply or len(reply.split()) < 3:
-        return True
-    words = reply.split()
-    if len(words) >= 6 and len(set(words)) <= max(2, len(words) // 4):
-        return True
-    return False
+def authorized(x_api_key: Optional[str]) -> None:
+    if REQUIRE_API_KEY:
+        if not TANZEEL_API_KEY:
+            raise HTTPException(503, "API authentication is not configured.")
+        if x_api_key != TANZEEL_API_KEY:
+            raise HTTPException(401, "Invalid or missing API key.")
 
 
 def call_hf_model(
@@ -215,23 +219,14 @@ def call_hf_model(
     temperature: float,
     top_p: float,
 ) -> str:
+    """Call Hugging Face Inference Providers via OpenAI-compatible endpoint."""
     if not HF_TOKEN:
-        raise HTTPException(500, "HF_TOKEN is not configured.")
+        raise HTTPException(503, "HF_TOKEN is not configured.")
 
-    system_prompt = SYSTEM_PROMPTS.get(public_name, DEFAULT_SYSTEM_PROMPT)
-
-    # Proper messages list — HF applies the correct chat template for
-    # whichever model this repo actually is (ChatML for Qwen, etc.)
-    # server-side. No manual prompt-string building, no risk of using the
-    # wrong special tokens for a given base model.
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history)
+    system_prompt = MODEL_PROMPTS.get(public_name, SYSTEM_PROMPT)
+    messages = [{"role": "system", "content": system_prompt}, *history]
     messages.append({"role": "user", "content": user_message})
 
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json",
-    }
     payload = {
         "model": repo,
         "messages": messages,
@@ -240,25 +235,61 @@ def call_hf_model(
         "top_p": top_p,
         "stream": False,
     }
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json",
+    }
 
-    url = HF_CHAT_API_TEMPLATE.format(repo=repo)
-    resp = requests.post(url, headers=headers, json=payload, timeout=120)
+    last_error = "unknown error"
+    for attempt in range(4):
+        try:
+            resp = requests.post(
+                HF_CHAT_URL, headers=headers, json=payload, timeout=120
+            )
 
-    if resp.status_code == 503:
-        time.sleep(20)
-        resp = requests.post(url, headers=headers, json=payload, timeout=120)
+            # Rate limit / cold start → retry with backoff
+            if resp.status_code in (429, 503):
+                retry_after = resp.headers.get("retry-after")
+                try:
+                    delay = float(retry_after) if retry_after else 2 ** attempt * 2
+                except ValueError:
+                    delay = 2 ** attempt * 2
+                time.sleep(min(delay, 30))
+                continue
 
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"HF error for '{repo}' ({resp.status_code}): {resp.text[:300]}",
-        )
+            if resp.status_code != 200:
+                # Include response body for easier debugging
+                try:
+                    err_body = resp.json()
+                except Exception:
+                    err_body = resp.text[:300]
+                raise HTTPException(
+                    502,
+                    f"HF inference failed ({resp.status_code}): {err_body}",
+                )
 
-    data = resp.json()
-    try:
-        return data["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError, TypeError):
-        return ""
+            data = resp.json()
+            try:
+                content = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError) as exc:
+                raise HTTPException(
+                    502, f"HF returned an invalid chat response: {data}"
+                ) from exc
+
+            if not isinstance(content, str) or not content.strip():
+                raise HTTPException(502, "HF returned an empty response.")
+            return content.strip()
+
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            if attempt < 3:
+                time.sleep(2 ** attempt)
+        except HTTPException:
+            raise
+
+    raise HTTPException(
+        503, f"HF inference unavailable after retries: {last_error}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -267,7 +298,7 @@ def call_hf_model(
 @app.get("/")
 def root():
     return {
-        "name": "Tanzeel Multi-Model API",
+        "name": "Tanzeel Intelligence API",
         "status": "online",
         "default_model": DEFAULT_MODEL,
         "models": list(MODELS.keys()),
@@ -281,98 +312,79 @@ def health():
         "models_count": len(MODELS),
         "default_model": DEFAULT_MODEL,
         "hf_configured": bool(HF_TOKEN),
-        "api_key_configured": bool(TANZEEL_API_KEY),
+        "api_key_required": REQUIRE_API_KEY,
+        "environment": ENVIRONMENT,
+        "allowed_origins": ALLOWED_ORIGINS,
     }
 
 
 @app.get("/models")
 def list_models():
-    """
-    Frontend can call this to discover available models.
-    Returns public names + HF repos (repo hidden in production if you prefer).
-    """
     return {
         "default": DEFAULT_MODEL,
-        "models": [
-            {"name": name, "repo": repo}
-            for name, repo in MODELS.items()
-        ],
+        "models": [{"name": name} for name in MODELS],
     }
 
 
 @app.post("/reset")
-def reset(req: ResetRequest):
-    SESSIONS.pop(req.session_id, None)
+def reset(
+    req: ResetRequest,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+):
+    authorized(x_api_key)
+    suffix = f":{req.session_id}"
+    for key in list(SESSIONS):
+        if key.endswith(suffix):
+            SESSIONS.pop(key, None)
     return {"ok": True}
 
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(
     req: ChatRequest,
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
-    # ── Auth ─────────────────────────────────────────────────────────────
-    provided_key = x_api_key or req.api_key
-    if TANZEEL_API_KEY and provided_key != TANZEEL_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
-
-    # ── Model routing ────────────────────────────────────────────────────
+    authorized(x_api_key)
     public_name, repo = resolve_model(req.model)
 
-    # ── Session ──────────────────────────────────────────────────────────
     session_id = req.session_id or str(uuid.uuid4())
-    # Sessions are namespaced per model so switching models doesn't mix context
     session_key = f"{public_name}:{session_id}"
-    history = SESSIONS.get(session_key, [])
+    history = get_session(session_key)
 
-    # ── Inference ────────────────────────────────────────────────────────
-    try:
-        reply_text = call_hf_model(
-            repo=repo,
-            public_name=public_name,
-            user_message=req.message,
-            history=history,
-            max_new_tokens=req.max_new_tokens,
-            temperature=req.temperature,
-            top_p=req.top_p,
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, f"Inference failed: {e}")
+    reply = call_hf_model(
+        repo=repo,
+        public_name=public_name,
+        user_message=req.message.strip(),
+        history=history,
+        max_new_tokens=req.max_new_tokens,
+        temperature=req.temperature,
+        top_p=req.top_p,
+    )
 
-    source = "tanzeel"
-
-    if req.allow_web_fallback and looks_low_quality(reply_text):
-        web_answer = web_search_fallback(req.message)
-        if web_answer:
-            reply_text = web_answer
-            source = "web_search"
-
-    if not reply_text:
-        reply_text = "(no response — try rephrasing)"
-
-    # ── Save session ─────────────────────────────────────────────────────
-    history.append({"role": "user", "content": req.message})
-    history.append({"role": "assistant", "content": reply_text})
-    if len(history) > MAX_SESSION_TURNS * 2:
-        history = history[-MAX_SESSION_TURNS * 2:]
-    SESSIONS[session_key] = history
+    history.extend(
+        [
+            {"role": "user", "content": req.message.strip()},
+            {"role": "assistant", "content": reply},
+        ]
+    )
+    put_session(session_key, history)
 
     return ChatResponse(
-        reply=reply_text,
+        reply=reply,
         session_id=session_id,
         model=public_name,
-        source=source,
+        source="tanzeel",
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# LOCAL DEV
+# LOCAL RUN
 # ─────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    print(f"Models loaded: {list(MODELS.keys())}")
-    print(f"Default model: {DEFAULT_MODEL}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+    )
