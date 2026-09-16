@@ -22,42 +22,49 @@ from server.tools.registry import execute_tool
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# SYSTEM PROMPT
+# SYSTEM PROMPT (backticks avoided to prevent string break)
 # ─────────────────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are Tanzeel Intelligence — an AI assistant built by ZEAIPC (Zikr-e-Ameen Innovations & Programming Corporation), founded by Arman Ansari.
+
+SYSTEM_PROMPT = """You are Tanzeel Intelligence — an AI assistant built by ZEAIPC, founded by Arman Ansari.
 
 # CORE BEHAVIOR
-Answer the user's question directly and concisely. Do not preface responses with introductions or self-references.
+Answer directly and concisely. No filler, no self-intro.
 
 # IDENTITY (ONLY WHEN ASKED)
-Mention your name/creator ONLY when the user directly asks about identity:
-- "Tum kaun ho?" / "Who are you?" / "Who made you?" / "Tumhara developer kaun hai?"
+Mention name/creator ONLY when user directly asks:
+- "Tum kaun ho?" / "Who are you?" / "Who made you?"
 
 Reply format:
 - Hinglish: "Main Tanzeel Intelligence hoon, ZEAIPC ne banaya hai. Developer Arman Ansari hain."
 - English: "I'm Tanzeel Intelligence, built by ZEAIPC. My developer is Arman Ansari."
 
-For ALL other questions — just answer. Do NOT mention identity/creator.
+Otherwise, NEVER mention identity.
 
-# BASE MODEL / TECH QUESTIONS
-If asked what model/architecture you use:
+# BASE MODEL QUESTIONS
+If asked about base model or architecture:
 "Main Tanzeel Intelligence hoon, ZEAIPC ne banaya hai. Technical details proprietary hain."
 Never mention Qwen, Llama, Gemma, OpenAI, or any third-party model.
 
-# WEB RESEARCH CONTEXT
-Sometimes you'll receive a "WEB RESEARCH CONTEXT" section with information from live web searches. When you see this:
-1. USE the provided information to answer the user's question
-2. Cite sources at the end as: "Sources:\\n- [title](url)"
-3. Do NOT say "I searched the web" — just answer naturally with the info
-4. If the context doesn't help, say so honestly and answer from your knowledge
+# CRITICAL — WEB RESEARCH CONTEXT RULES
+
+When the user message contains a [WEB RESEARCH CONTEXT] block:
+
+1. ONLY use the information from that block to answer.
+2. DO NOT add facts from your own memory — your training data may be outdated.
+3. DO NOT invent URLs. Only use the URLs provided in the context block. Copy them exactly.
+4. If the context doesn't have the answer, say in the user's language:
+   "Mujhe latest information nahi mili, but general guidance ye hai: ..."
+   Then clearly separate general knowledge from research.
+5. At the very end, list ONLY the sources from the context block. Format them as a Markdown list with each source as a link: [title](url). Only use the exact URLs provided.
+6. If there are no sources in the context, do not add a sources section at all.
+
+NEVER make up URLs. NEVER fabricate company names or facts. If unsure, say so.
 
 # LANGUAGE
-Reply in the same language the user uses — Hindi, English, or Hinglish.
+Reply in the user's language (Hindi/English/Hinglish).
 
 # STYLE
-- Get to the point. Skip filler.
-- Use Markdown for code, lists, emphasis.
-- Be warm but efficient. If unsure, say so.
+Direct, warm, efficient. Use Markdown. Skip filler.
 """
 
 
@@ -87,7 +94,7 @@ DEFAULT_MODELS = {
 }
 
 
-def load_models() -> dict[str, str]:
+def load_models() -> dict:
     raw = os.getenv("MODELS", "").strip()
     if not raw:
         return DEFAULT_MODELS.copy()
@@ -116,34 +123,27 @@ MODEL_PROMPTS = {
     "tanzeel-intelligence": SYSTEM_PROMPT,
 }
 
+
 # ─────────────────────────────────────────────────────────────────────────
 # HEURISTIC TOOL DETECTION
 # ─────────────────────────────────────────────────────────────────────────
-# Keywords that trigger web research
 WEB_TRIGGER_KEYWORDS = [
-    # English
     r"\blatest\b", r"\bcurrent\b", r"\btoday\b", r"\bnow\b",
     r"\bnews\b", r"\brecent\b", r"\bupdates?\b",
     r"\bweather\b", r"\btemperature\b", r"\bforecast\b",
     r"\bprice\b", r"\bstock\b", r"\bcrypto\b", r"\bbitcoin\b",
     r"\bscore\b", r"\bmatch\b", r"\bwon\b", r"\belection\b",
-    r"\bwhen\s+(is|was|did)\b", r"\bwho\s+(is|won)\b",
-    # Hinglish/Hindi
     r"\baaj\b", r"\babhi\b", r"\btaza\b", r"\btaja\b",
-    r"\bkhabar\b", r"\bkhabrein\b", r"\bnews\b",
-    r"\bmausam\b", r"\btaapman\b", r"\bkitna\b.*\b(ka|hai)\b",
+    r"\bkhabar\b", r"\bkhabrein\b",
+    r"\bmausam\b", r"\btaapman\b",
     r"\bkaun\s+(jeeta|hai)\b",
     r"\bkya\s+chal\s+raha\b",
 ]
 
-WEB_TRIGGER_PATTERN = re.compile(
-    "|".join(WEB_TRIGGER_KEYWORDS),
-    re.IGNORECASE,
-)
+WEB_TRIGGER_PATTERN = re.compile("|".join(WEB_TRIGGER_KEYWORDS), re.IGNORECASE)
 
 
 def should_use_web(message: str) -> bool:
-    """Heuristic: does this message need live web data?"""
     if not message or len(message) < 3:
         return False
     return bool(WEB_TRIGGER_PATTERN.search(message))
@@ -152,7 +152,7 @@ def should_use_web(message: str) -> bool:
 # ─────────────────────────────────────────────────────────────────────────
 # APP
 # ─────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Tanzeel Intelligence API", version="4.1.0")
+app = FastAPI(title="Tanzeel Intelligence API", version="4.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -165,11 +165,11 @@ app.add_middleware(
 MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", "5000"))
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
 MAX_SESSION_TURNS = int(os.getenv("MAX_SESSION_TURNS", "10"))
-SESSIONS: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
+SESSIONS: OrderedDict = OrderedDict()
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# REQUEST / RESPONSE
+# REQUEST / RESPONSE MODELS
 # ─────────────────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=8000)
@@ -187,7 +187,7 @@ class ChatResponse(BaseModel):
     model: str
     source: str
     tool_calls_made: int = 0
-    sources: list[dict] = []
+    sources: list = []
 
 
 class ResetRequest(BaseModel):
@@ -195,7 +195,7 @@ class ResetRequest(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# SESSIONS
+# SESSION MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────
 def cleanup_sessions() -> None:
     now = time.time()
@@ -206,7 +206,7 @@ def cleanup_sessions() -> None:
         SESSIONS.popitem(last=False)
 
 
-def get_session(key: str) -> list[dict]:
+def get_session(key: str) -> list:
     cleanup_sessions()
     item = SESSIONS.get(key)
     if item is None:
@@ -216,7 +216,7 @@ def get_session(key: str) -> list[dict]:
     return list(history)
 
 
-def put_session(key: str, history: list[dict]) -> None:
+def put_session(key: str, history: list) -> None:
     cleanup_sessions()
     SESSIONS[key] = (time.time(), history[-(MAX_SESSION_TURNS * 2):])
     SESSIONS.move_to_end(key)
@@ -226,7 +226,7 @@ def put_session(key: str, history: list[dict]) -> None:
 # ─────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────
-def resolve_model(requested: Optional[str]) -> tuple[str, str]:
+def resolve_model(requested: Optional[str]):
     public_name = requested or DEFAULT_MODEL
     if public_name not in MODELS:
         raise HTTPException(400, f"Unknown model '{public_name}'. Available: {list(MODELS)}")
@@ -244,12 +244,11 @@ def authorized(x_api_key: Optional[str]) -> None:
 def call_hf_model(
     repo: str,
     system_prompt: str,
-    messages: list[dict],
+    messages: list,
     max_new_tokens: int,
     temperature: float,
     top_p: float,
 ) -> str:
-    """Call HF Inference API. No tools — plain chat completions."""
     if not HF_TOKEN:
         raise HTTPException(503, "HF_TOKEN is not configured.")
 
@@ -372,12 +371,13 @@ def chat(
 
     user_message = req.message.strip()
     tool_calls_made = 0
-    sources: list[dict] = []
+    sources = []
+    final_user_message = user_message
 
     # ── Heuristic tool trigger ───────────────────────────────────────────
     if ENABLE_TOOLS and req.enable_tools and should_use_web(user_message):
         try:
-            print(f"[tools] Heuristic triggered research for: {user_message[:80]}")
+            print(f"[tools] Research triggered: {user_message[:80]}")
             result = execute_tool("research", {"query": user_message, "max_pages": 2})
             tool_calls_made = 1
 
@@ -385,31 +385,32 @@ def chat(
                 sources = result["sources"]
 
             if result.get("context"):
-                # Inject web context as a system-level note BEFORE user message
-                web_context_note = (
-                    f"[WEB RESEARCH CONTEXT — from live search]\n"
+                sources_block = "\n".join(
+                    f"- {s.get('title','Source')}: {s.get('url','')}"
+                    for s in sources
+                    if s.get("url")
+                ) or "(no sources available)"
+
+                final_user_message = (
+                    "[WEB RESEARCH CONTEXT — USE ONLY THIS DATA]\n"
                     f"Query: {result['query']}\n\n"
-                    f"{result['context']}\n"
-                    f"[END WEB RESEARCH CONTEXT]\n\n"
-                    f"Use the above information to answer accurately. "
-                    f"Cite sources at the end as Markdown links."
+                    f"Content:\n{result['context']}\n\n"
+                    f"AVAILABLE SOURCES (use ONLY these exact URLs):\n"
+                    f"{sources_block}\n"
+                    "[END CONTEXT]\n\n"
+                    "---\n\n"
+                    f"USER'S QUESTION: {user_message}\n\n"
+                    "Answer using ONLY the context above. If the context is "
+                    "insufficient, say so honestly — do NOT fill gaps from memory. "
+                    "End with a Sources section using ONLY the URLs listed above."
                 )
-                # Add as a system-role message just before user
-                history_with_context = [
-                    *history,
-                    {"role": "system", "content": web_context_note},
-                ]
             else:
-                print(f"[tools] Research returned no context: {result.get('error')}")
-                history_with_context = history
+                print(f"[tools] No context: {result.get('error')}")
         except Exception as e:
             print(f"[tools] Research failed: {e}")
-            history_with_context = history
-    else:
-        history_with_context = history
 
-    # ── Call model (plain, no tools) ─────────────────────────────────────
-    messages = [*history_with_context, {"role": "user", "content": user_message}]
+    # ── Call model ───────────────────────────────────────────────────────
+    messages = [*history, {"role": "user", "content": final_user_message}]
 
     reply = call_hf_model(
         repo=repo,
@@ -420,7 +421,7 @@ def chat(
         top_p=req.top_p,
     )
 
-    # ── Update session (without the injected context) ────────────────────
+    # ── Save session with ORIGINAL user message ──────────────────────────
     history.extend([
         {"role": "user", "content": user_message},
         {"role": "assistant", "content": reply},
