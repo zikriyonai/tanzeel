@@ -111,7 +111,7 @@ ALLOWED_ORIGINS = [
 # 🔥 FIXED: Point to the preview model you just uploaded
 # Option 1 — Llama 3.1 8B (Recommended — fast + reliable)
 DEFAULT_MODELS = {
-    "tanzeel-preview": "meta-llama/Llama-3.1-8B-Instruct:together",
+    "tanzeel-preview": "Qwen/Qwen3-8B:together",
 }
 
 
