@@ -1,13 +1,18 @@
 """
-Tanzeel Intelligence FastAPI proxy with heuristic web research.
-Uses manual keyword-based tool triggering (no function calling needed).
+Tanzeel Intelligence FastAPI proxy.
+
+Routes requests to Hugging Face Inference Providers using the current
+OpenAI-compatible router endpoint. Sessions are bounded with TTL/LRU cleanup.
+
+Deploy on Render. Used by:
+- https://tanzeelai.web.app  (production)
+- http://localhost:7700     (local dev)
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import time
 import uuid
 from collections import OrderedDict
@@ -18,56 +23,69 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from server.tools.registry import execute_tool
-
-
 # ─────────────────────────────────────────────────────────────────────────
-# SYSTEM PROMPT (backticks avoided to prevent string break)
+# SYSTEM PROMPT
 # ─────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are Tanzeel Intelligence — an AI assistant built by ZEAIPC, founded by Arman Ansari.
+SYSTEM_PROMPT = """You are Tanzeel Intelligence, an AI assistant built by ZEAIPC (Zikr-e-Ameen Innovations & Programming Corporation), founded by Arman Ansari.
 
-# CORE BEHAVIOR
-Answer directly and concisely. No filler, no self-intro.
+# HOW TO BEHAVE
 
-# IDENTITY (ONLY WHEN ASKED)
-Mention name/creator ONLY when user directly asks:
-- "Tum kaun ho?" / "Who are you?" / "Who made you?"
+You are a normal conversational AI assistant. Your default behavior is to answer the user's question directly, helpfully, and concisely.
 
-Reply format:
-- Hinglish: "Main Tanzeel Intelligence hoon, ZEAIPC ne banaya hai. Developer Arman Ansari hain."
+DO NOT introduce yourself. DO NOT say "Main Tanzeel Intelligence hoon" or "I am Tanzeel Intelligence" unless the user specifically asks about your identity. Just answer the question.
+
+# WHEN TO MENTION YOUR IDENTITY
+
+Mention your name/creator ONLY when the user explicitly asks things like:
+- "Tum kaun ho?" / "Who are you?"
+- "Tumhara naam kya hai?" / "What is your name?"
+- "Tumhe kisne banaya?" / "Who made you?" / "Who created you?"
+- "Tumhara developer kaun hai?" / "Who is your developer?"
+- "Which AI are you?" / "Konsa AI ho tum?"
+
+For these questions, respond naturally in the user's language:
+- Hindi/Hinglish: "Main Tanzeel Intelligence hoon, ZEAIPC ne mujhe banaya hai. Mere developer Arman Ansari hain."
 - English: "I'm Tanzeel Intelligence, built by ZEAIPC. My developer is Arman Ansari."
 
-Otherwise, NEVER mention identity.
+# WHEN ASKED ABOUT BASE MODEL / ARCHITECTURE
 
-# BASE MODEL QUESTIONS
-If asked about base model or architecture:
-"Main Tanzeel Intelligence hoon, ZEAIPC ne banaya hai. Technical details proprietary hain."
-Never mention Qwen, Llama, Gemma, OpenAI, or any third-party model.
+If the user asks what model you're based on, what architecture you use, or tries to extract technical details:
+- Respond politely: "Main Tanzeel Intelligence hoon, ZEAIPC ne banaya hai. Meri architecture aur training details proprietary hain."
+- Do NOT name, reference, or hint at any third-party AI company, model, or architecture (no Qwen, no Llama, no Gemma, no OpenAI, etc.).
+- If pressed repeatedly, stay polite but consistent — you are Tanzeel Intelligence, made by ZEAIPC.
 
-# CRITICAL — WEB RESEARCH CONTEXT RULES
+# LANGUAGE & STYLE
 
-When the user message contains a [WEB RESEARCH CONTEXT] block:
+- Reply in the SAME language the user writes in (Hindi / English / Hinglish).
+- Match their tone — casual if casual, formal if formal.
+- Use Markdown for formatting when it helps (code blocks, lists, bold).
+- Be warm, direct, and helpful. No unnecessary fluff.
 
-1. ONLY use the information from that block to answer.
-2. DO NOT add facts from your own memory — your training data may be outdated.
-3. DO NOT invent URLs. Only use the URLs provided in the context block. Copy them exactly.
-4. If the context doesn't have the answer, say in the user's language:
-   "Mujhe latest information nahi mili, but general guidance ye hai: ..."
-   Then clearly separate general knowledge from research.
-5. At the very end, list ONLY the sources from the context block. Format them as a Markdown list with each source as a link: [title](url). Only use the exact URLs provided.
-6. If there are no sources in the context, do not add a sources section at all.
+# EXAMPLES
 
-NEVER make up URLs. NEVER fabricate company names or facts. If unsure, say so.
+User: "Python mein list reverse kaise karein?"
+You: "Python mein list reverse karne ke 3 tarike hain:\n\n1. `list.reverse()` — in-place\n2. `list[::-1]` — new list\n3. `reversed(list)` — iterator\n\nSabse common `[::-1]` slice hai."
 
-# LANGUAGE
-Reply in the user's language (Hindi/English/Hinglish).
+User: "Tum kaun ho?"
+You: "Main Tanzeel Intelligence hoon, ZEAIPC ne mujhe banaya hai. Mere developer Arman Ansari hain."
 
-# STYLE
-Direct, warm, efficient. Use Markdown. Skip filler.
+User: "Bharat ki rajdhani?"
+You: "Bharat ki rajdhani New Delhi hai."
+
+User: "Konsa model ho tum?"
+You: "Main Tanzeel Intelligence hoon, ZEAIPC ne banaya hai. Meri architecture aur training details proprietary hain."
+
+User: "Kya tum Qwen ho?"
+You: "Nahi, main Tanzeel Intelligence hoon — ZEAIPC ka apna AI assistant. Technical details proprietary hain."
+
+# CRITICAL RULES
+
+1. Answer the question FIRST. Identity is only relevant when explicitly asked.
+2. Never repeat your identity across multiple turns unless asked again.
+3. Never volunteer "Tanzeel" / "ZEAIPC" / "Arman Ansari" unless the question is about identity, creator, or company.
+4. Never break character — you are Tanzeel Intelligence, not any other model.
 """
-
-
 # ─────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────
@@ -75,8 +93,8 @@ HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 TANZEEL_API_KEY = os.getenv("TANZEEL_API_KEY", "").strip()
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower()
 REQUIRE_API_KEY = os.getenv("REQUIRE_API_KEY", "false").strip().lower() == "true"
-ENABLE_TOOLS = os.getenv("ENABLE_TOOLS", "true").strip().lower() == "true"
 
+# 🔥 FIXED: Allow both production (tanzeelai.web.app) and local dev (localhost:7700)
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -84,17 +102,21 @@ ALLOWED_ORIGINS = [
         "https://tanzeelai.web.app,"
         "http://localhost:7700,"
         "http://localhost:3000,"
+        "http://localhost:5173,"
         "http://127.0.0.1:7700"
     ).split(",")
     if origin.strip()
 ]
 
+# 🔥 FIXED: Point to the preview model you just uploaded
+# Option 1 — Llama 3.1 8B (Recommended — fast + reliable)
 DEFAULT_MODELS = {
     "tanzeel-preview": "Qwen/Qwen3-VL-8B-Instruct:featherless-ai",
 }
 
 
-def load_models() -> dict:
+def load_models() -> dict[str, str]:
+    """Load models from MODELS env var (JSON) or fall back to defaults."""
     raw = os.getenv("MODELS", "").strip()
     if not raw:
         return DEFAULT_MODELS.copy()
@@ -104,6 +126,11 @@ def load_models() -> dict:
         raise RuntimeError("MODELS must be valid JSON.") from exc
     if not isinstance(parsed, dict) or not parsed:
         raise RuntimeError("MODELS must be a non-empty JSON object.")
+    if not all(
+        isinstance(k, str) and isinstance(v, str) and k and v
+        for k, v in parsed.items()
+    ):
+        raise RuntimeError("MODELS must map non-empty model names to HF repo IDs.")
     return parsed
 
 
@@ -111,11 +138,20 @@ MODELS = load_models()
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "").strip() or next(iter(MODELS))
 
 if DEFAULT_MODEL not in MODELS:
-    raise RuntimeError(f"DEFAULT_MODEL={DEFAULT_MODEL!r} not in MODELS.")
+    raise RuntimeError(
+        f"DEFAULT_MODEL={DEFAULT_MODEL!r} is not present in MODELS."
+    )
 
+# Production checks
 if ENVIRONMENT == "production" and not HF_TOKEN:
     raise RuntimeError("HF_TOKEN must be configured in production.")
 
+if ENVIRONMENT == "production" and REQUIRE_API_KEY and not TANZEEL_API_KEY:
+    raise RuntimeError(
+        "TANZEEL_API_KEY must be configured when REQUIRE_API_KEY=true."
+    )
+
+# 🔥 HF Router (current, non-deprecated endpoint)
 HF_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
 
 MODEL_PROMPTS = {
@@ -123,36 +159,10 @@ MODEL_PROMPTS = {
     "tanzeel-intelligence": SYSTEM_PROMPT,
 }
 
-
 # ─────────────────────────────────────────────────────────────────────────
-# HEURISTIC TOOL DETECTION
+# FASTAPI APP
 # ─────────────────────────────────────────────────────────────────────────
-WEB_TRIGGER_KEYWORDS = [
-    r"\blatest\b", r"\bcurrent\b", r"\btoday\b", r"\bnow\b",
-    r"\bnews\b", r"\brecent\b", r"\bupdates?\b",
-    r"\bweather\b", r"\btemperature\b", r"\bforecast\b",
-    r"\bprice\b", r"\bstock\b", r"\bcrypto\b", r"\bbitcoin\b",
-    r"\bscore\b", r"\bmatch\b", r"\bwon\b", r"\belection\b",
-    r"\baaj\b", r"\babhi\b", r"\btaza\b", r"\btaja\b",
-    r"\bkhabar\b", r"\bkhabrein\b",
-    r"\bmausam\b", r"\btaapman\b",
-    r"\bkaun\s+(jeeta|hai)\b",
-    r"\bkya\s+chal\s+raha\b",
-]
-
-WEB_TRIGGER_PATTERN = re.compile("|".join(WEB_TRIGGER_KEYWORDS), re.IGNORECASE)
-
-
-def should_use_web(message: str) -> bool:
-    if not message or len(message) < 3:
-        return False
-    return bool(WEB_TRIGGER_PATTERN.search(message))
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# APP
-# ─────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Tanzeel Intelligence API", version="4.2.0")
+app = FastAPI(title="Tanzeel Intelligence API", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -162,10 +172,11 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-API-Key"],
 )
 
+# Bounded in-memory session store.
 MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", "5000"))
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
 MAX_SESSION_TURNS = int(os.getenv("MAX_SESSION_TURNS", "10"))
-SESSIONS: OrderedDict = OrderedDict()
+SESSIONS: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -178,7 +189,7 @@ class ChatRequest(BaseModel):
     max_new_tokens: int = Field(default=500, ge=1, le=2048)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     top_p: float = Field(default=0.9, gt=0.0, le=1.0)
-    enable_tools: bool = True
+    allow_web_fallback: bool = False
 
 
 class ChatResponse(BaseModel):
@@ -186,8 +197,6 @@ class ChatResponse(BaseModel):
     session_id: str
     model: str
     source: str
-    tool_calls_made: int = 0
-    sources: list = []
 
 
 class ResetRequest(BaseModel):
@@ -199,14 +208,18 @@ class ResetRequest(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────
 def cleanup_sessions() -> None:
     now = time.time()
-    expired = [k for k, (last, _) in SESSIONS.items() if now - last > SESSION_TTL_SECONDS]
-    for k in expired:
-        SESSIONS.pop(k, None)
+    expired = [
+        key for key, (last_seen, _) in SESSIONS.items()
+        if now - last_seen > SESSION_TTL_SECONDS
+    ]
+    for key in expired:
+        SESSIONS.pop(key, None)
+
     while len(SESSIONS) > MAX_SESSIONS:
         SESSIONS.popitem(last=False)
 
 
-def get_session(key: str) -> list:
+def get_session(key: str) -> list[dict]:
     cleanup_sessions()
     item = SESSIONS.get(key)
     if item is None:
@@ -216,7 +229,7 @@ def get_session(key: str) -> list:
     return list(history)
 
 
-def put_session(key: str, history: list) -> None:
+def put_session(key: str, history: list[dict]) -> None:
     cleanup_sessions()
     SESSIONS[key] = (time.time(), history[-(MAX_SESSION_TURNS * 2):])
     SESSIONS.move_to_end(key)
@@ -226,10 +239,13 @@ def put_session(key: str, history: list) -> None:
 # ─────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────
-def resolve_model(requested: Optional[str]):
+def resolve_model(requested: Optional[str]) -> tuple[str, str]:
     public_name = requested or DEFAULT_MODEL
     if public_name not in MODELS:
-        raise HTTPException(400, f"Unknown model '{public_name}'. Available: {list(MODELS)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model '{public_name}'. Available: {list(MODELS)}",
+        )
     return public_name, MODELS[public_name]
 
 
@@ -243,18 +259,24 @@ def authorized(x_api_key: Optional[str]) -> None:
 
 def call_hf_model(
     repo: str,
-    system_prompt: str,
-    messages: list,
+    public_name: str,
+    user_message: str,
+    history: list[dict],
     max_new_tokens: int,
     temperature: float,
     top_p: float,
 ) -> str:
+    """Call Hugging Face Inference Providers via OpenAI-compatible endpoint."""
     if not HF_TOKEN:
         raise HTTPException(503, "HF_TOKEN is not configured.")
 
+    system_prompt = MODEL_PROMPTS.get(public_name, SYSTEM_PROMPT)
+    messages = [{"role": "system", "content": system_prompt}, *history]
+    messages.append({"role": "user", "content": user_message})
+
     payload = {
         "model": repo,
-        "messages": [{"role": "system", "content": system_prompt}, *messages],
+        "messages": messages,
         "max_tokens": max_new_tokens,
         "temperature": temperature,
         "top_p": top_p,
@@ -265,11 +287,14 @@ def call_hf_model(
         "Content-Type": "application/json",
     }
 
-    last_error = "unknown"
+    last_error = "unknown error"
     for attempt in range(4):
         try:
-            resp = requests.post(HF_CHAT_URL, headers=headers, json=payload, timeout=120)
+            resp = requests.post(
+                HF_CHAT_URL, headers=headers, json=payload, timeout=120
+            )
 
+            # Rate limit / cold start → retry with backoff
             if resp.status_code in (429, 503):
                 retry_after = resp.headers.get("retry-after")
                 try:
@@ -280,20 +305,26 @@ def call_hf_model(
                 continue
 
             if resp.status_code != 200:
+                # Include response body for easier debugging
                 try:
                     err_body = resp.json()
                 except Exception:
                     err_body = resp.text[:300]
-                raise HTTPException(502, f"HF error ({resp.status_code}): {err_body}")
+                raise HTTPException(
+                    502,
+                    f"HF inference failed ({resp.status_code}): {err_body}",
+                )
 
             data = resp.json()
             try:
                 content = data["choices"][0]["message"]["content"]
             except (KeyError, IndexError, TypeError) as exc:
-                raise HTTPException(502, f"Invalid HF response: {data}") from exc
+                raise HTTPException(
+                    502, f"HF returned an invalid chat response: {data}"
+                ) from exc
 
             if not isinstance(content, str) or not content.strip():
-                raise HTTPException(502, "HF returned empty response.")
+                raise HTTPException(502, "HF returned an empty response.")
             return content.strip()
 
         except requests.RequestException as exc:
@@ -303,7 +334,9 @@ def call_hf_model(
         except HTTPException:
             raise
 
-    raise HTTPException(503, f"HF unavailable: {last_error}")
+    raise HTTPException(
+        503, f"HF inference unavailable after retries: {last_error}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -316,8 +349,6 @@ def root():
         "status": "online",
         "default_model": DEFAULT_MODEL,
         "models": list(MODELS.keys()),
-        "tools_enabled": ENABLE_TOOLS,
-        "tool_mode": "heuristic",
     }
 
 
@@ -330,8 +361,7 @@ def health():
         "hf_configured": bool(HF_TOKEN),
         "api_key_required": REQUIRE_API_KEY,
         "environment": ENVIRONMENT,
-        "tools_enabled": ENABLE_TOOLS,
-        "tool_mode": "heuristic",
+        "allowed_origins": ALLOWED_ORIGINS,
     }
 
 
@@ -363,78 +393,34 @@ def chat(
 ):
     authorized(x_api_key)
     public_name, repo = resolve_model(req.model)
-    system_prompt = MODEL_PROMPTS.get(public_name, SYSTEM_PROMPT)
 
     session_id = req.session_id or str(uuid.uuid4())
     session_key = f"{public_name}:{session_id}"
     history = get_session(session_key)
 
-    user_message = req.message.strip()
-    tool_calls_made = 0
-    sources = []
-    final_user_message = user_message
-
-    # ── Heuristic tool trigger ───────────────────────────────────────────
-    if ENABLE_TOOLS and req.enable_tools and should_use_web(user_message):
-        try:
-            print(f"[tools] Research triggered: {user_message[:80]}")
-            result = execute_tool("research", {"query": user_message, "max_pages": 2})
-            tool_calls_made = 1
-
-            if result.get("sources"):
-                sources = result["sources"]
-
-            if result.get("context"):
-                sources_block = "\n".join(
-                    f"- {s.get('title','Source')}: {s.get('url','')}"
-                    for s in sources
-                    if s.get("url")
-                ) or "(no sources available)"
-
-                final_user_message = (
-                    "[WEB RESEARCH CONTEXT — USE ONLY THIS DATA]\n"
-                    f"Query: {result['query']}\n\n"
-                    f"Content:\n{result['context']}\n\n"
-                    f"AVAILABLE SOURCES (use ONLY these exact URLs):\n"
-                    f"{sources_block}\n"
-                    "[END CONTEXT]\n\n"
-                    "---\n\n"
-                    f"USER'S QUESTION: {user_message}\n\n"
-                    "Answer using ONLY the context above. If the context is "
-                    "insufficient, say so honestly — do NOT fill gaps from memory. "
-                    "End with a Sources section using ONLY the URLs listed above."
-                )
-            else:
-                print(f"[tools] No context: {result.get('error')}")
-        except Exception as e:
-            print(f"[tools] Research failed: {e}")
-
-    # ── Call model ───────────────────────────────────────────────────────
-    messages = [*history, {"role": "user", "content": final_user_message}]
-
     reply = call_hf_model(
         repo=repo,
-        system_prompt=system_prompt,
-        messages=messages,
+        public_name=public_name,
+        user_message=req.message.strip(),
+        history=history,
         max_new_tokens=req.max_new_tokens,
         temperature=req.temperature,
         top_p=req.top_p,
     )
 
-    # ── Save session with ORIGINAL user message ──────────────────────────
-    history.extend([
-        {"role": "user", "content": user_message},
-        {"role": "assistant", "content": reply},
-    ])
+    history.extend(
+        [
+            {"role": "user", "content": req.message.strip()},
+            {"role": "assistant", "content": reply},
+        ]
+    )
     put_session(session_key, history)
 
     return ChatResponse(
         reply=reply,
         session_id=session_id,
         model=public_name,
-        source="tanzeel+web" if tool_calls_made > 0 else "tanzeel",
-        tool_calls_made=tool_calls_made,
-        sources=sources[:5],
+        source="tanzeel",
     )
 
 
@@ -443,4 +429,9 @@ def chat(
 # ─────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+    )
