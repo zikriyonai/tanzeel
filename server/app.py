@@ -1,11 +1,13 @@
 """
-Tanzeel Intelligence FastAPI proxy with WRC web research tools.
+Tanzeel Intelligence FastAPI proxy with heuristic web research.
+Uses manual keyword-based tool triggering (no function calling needed).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import uuid
 from collections import OrderedDict
@@ -16,7 +18,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from server.tools.registry import TOOL_DEFINITIONS, execute_tool
+from server.tools.registry import execute_tool
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -42,30 +44,20 @@ If asked what model/architecture you use:
 "Main Tanzeel Intelligence hoon, ZEAIPC ne banaya hai. Technical details proprietary hain."
 Never mention Qwen, Llama, Gemma, OpenAI, or any third-party model.
 
-# TOOLS — WEB RESEARCH
-You have tools: `research`, `web_search`, `fetch_page`.
-
-USE TOOLS when the user asks about:
-- Recent news, current events, "latest", "aaj ki", "abhi"
-- Real-time data: weather, stocks, prices, sports scores
-- Anything happening after your training cutoff
-- Facts you're uncertain about
-
-DO NOT use tools for:
-- General coding help, math, reasoning
-- Casual conversation, creative writing
-- Explaining concepts you already know
-
-When you use a tool and get results, USE the information to answer directly. Cite sources at the end as:
-"Sources:\n- [title](url)"
+# WEB RESEARCH CONTEXT
+Sometimes you'll receive a "WEB RESEARCH CONTEXT" section with information from live web searches. When you see this:
+1. USE the provided information to answer the user's question
+2. Cite sources at the end as: "Sources:\\n- [title](url)"
+3. Do NOT say "I searched the web" — just answer naturally with the info
+4. If the context doesn't help, say so honestly and answer from your knowledge
 
 # LANGUAGE
-Reply in the same language the user uses — Hindi, English, or Hinglish. Match their tone.
+Reply in the same language the user uses — Hindi, English, or Hinglish.
 
 # STYLE
-- Get to the point. Skip filler like "Great question!" or "Certainly!".
-- Use Markdown for code, lists, and emphasis when useful.
-- Be warm but efficient. If you don't know something, say so honestly.
+- Get to the point. Skip filler.
+- Use Markdown for code, lists, emphasis.
+- Be warm but efficient. If unsure, say so.
 """
 
 
@@ -125,9 +117,42 @@ MODEL_PROMPTS = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────
+# HEURISTIC TOOL DETECTION
+# ─────────────────────────────────────────────────────────────────────────
+# Keywords that trigger web research
+WEB_TRIGGER_KEYWORDS = [
+    # English
+    r"\blatest\b", r"\bcurrent\b", r"\btoday\b", r"\bnow\b",
+    r"\bnews\b", r"\brecent\b", r"\bupdates?\b",
+    r"\bweather\b", r"\btemperature\b", r"\bforecast\b",
+    r"\bprice\b", r"\bstock\b", r"\bcrypto\b", r"\bbitcoin\b",
+    r"\bscore\b", r"\bmatch\b", r"\bwon\b", r"\belection\b",
+    r"\bwhen\s+(is|was|did)\b", r"\bwho\s+(is|won)\b",
+    # Hinglish/Hindi
+    r"\baaj\b", r"\babhi\b", r"\btaza\b", r"\btaja\b",
+    r"\bkhabar\b", r"\bkhabrein\b", r"\bnews\b",
+    r"\bmausam\b", r"\btaapman\b", r"\bkitna\b.*\b(ka|hai)\b",
+    r"\bkaun\s+(jeeta|hai)\b",
+    r"\bkya\s+chal\s+raha\b",
+]
+
+WEB_TRIGGER_PATTERN = re.compile(
+    "|".join(WEB_TRIGGER_KEYWORDS),
+    re.IGNORECASE,
+)
+
+
+def should_use_web(message: str) -> bool:
+    """Heuristic: does this message need live web data?"""
+    if not message or len(message) < 3:
+        return False
+    return bool(WEB_TRIGGER_PATTERN.search(message))
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # APP
 # ─────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Tanzeel Intelligence API", version="4.0.0")
+app = FastAPI(title="Tanzeel Intelligence API", version="4.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -216,8 +241,31 @@ def authorized(x_api_key: Optional[str]) -> None:
             raise HTTPException(401, "Invalid or missing API key.")
 
 
-def _hf_request(payload: dict, headers: dict) -> dict:
-    """Make one HF request with retries."""
+def call_hf_model(
+    repo: str,
+    system_prompt: str,
+    messages: list[dict],
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+) -> str:
+    """Call HF Inference API. No tools — plain chat completions."""
+    if not HF_TOKEN:
+        raise HTTPException(503, "HF_TOKEN is not configured.")
+
+    payload = {
+        "model": repo,
+        "messages": [{"role": "system", "content": system_prompt}, *messages],
+        "max_tokens": max_new_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "stream": False,
+    }
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
     last_error = "unknown"
     for attempt in range(4):
         try:
@@ -239,119 +287,24 @@ def _hf_request(payload: dict, headers: dict) -> dict:
                     err_body = resp.text[:300]
                 raise HTTPException(502, f"HF error ({resp.status_code}): {err_body}")
 
-            return resp.json()
+            data = resp.json()
+            try:
+                content = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError) as exc:
+                raise HTTPException(502, f"Invalid HF response: {data}") from exc
+
+            if not isinstance(content, str) or not content.strip():
+                raise HTTPException(502, "HF returned empty response.")
+            return content.strip()
 
         except requests.RequestException as exc:
             last_error = str(exc)
             if attempt < 3:
                 time.sleep(2 ** attempt)
+        except HTTPException:
+            raise
 
-    raise HTTPException(503, f"HF unavailable after retries: {last_error}")
-
-
-def call_hf_with_tools(
-    repo: str,
-    public_name: str,
-    user_message: str,
-    history: list[dict],
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-    enable_tools: bool = True,
-) -> tuple[str, int, list[dict]]:
-    """
-    Call Qwen with tools. Handles function-calling loop.
-    Returns: (reply, tool_calls_count, sources)
-    """
-    if not HF_TOKEN:
-        raise HTTPException(503, "HF_TOKEN is not configured.")
-
-    system_prompt = MODEL_PROMPTS.get(public_name, SYSTEM_PROMPT)
-    messages = [{"role": "system", "content": system_prompt}, *history]
-    messages.append({"role": "user", "content": user_message})
-
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json",
-    }
-
-    tool_calls_made = 0
-    collected_sources: list[dict] = []
-    max_iterations = 4
-
-    for iteration in range(max_iterations):
-        payload = {
-            "model": repo,
-            "messages": messages,
-            "max_tokens": max_new_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "stream": False,
-        }
-
-        if enable_tools and ENABLE_TOOLS:
-            payload["tools"] = TOOL_DEFINITIONS
-            payload["tool_choice"] = "auto"
-
-        # Try with tools first; if provider rejects, fallback without tools
-        try:
-            data = _hf_request(payload, headers)
-        except HTTPException as e:
-            if enable_tools and "tool" in str(e).lower():
-                print(f"[tools] Provider rejected tools — falling back: {e}")
-                payload.pop("tools", None)
-                payload.pop("tool_choice", None)
-                data = _hf_request(payload, headers)
-            else:
-                raise
-
-        choice = data["choices"][0]
-        message = choice["message"]
-        tool_calls = message.get("tool_calls") or []
-
-        # No tool calls → final answer
-        if not tool_calls:
-            reply = (message.get("content") or "").strip()
-            if not reply:
-                reply = "(no response — try rephrasing)"
-            return reply, tool_calls_made, collected_sources
-
-        # Execute tools and loop
-        messages.append(message)
-
-        for tc in tool_calls:
-            tool_calls_made += 1
-            fn_name = tc["function"]["name"]
-            try:
-                fn_args = json.loads(tc["function"]["arguments"])
-            except json.JSONDecodeError:
-                fn_args = {}
-
-            print(f"[tools] Executing {fn_name}({fn_args})")
-            result = execute_tool(fn_name, fn_args)
-
-            # Collect sources
-            if fn_name == "research" and result.get("sources"):
-                collected_sources.extend(result["sources"])
-            elif fn_name == "web_search" and result.get("results"):
-                for r in result["results"][:3]:
-                    if r.get("url"):
-                        collected_sources.append({
-                            "title": r.get("title", ""),
-                            "url": r["url"],
-                        })
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "content": json.dumps(result, ensure_ascii=False)[:8000],
-            })
-
-    return (
-        "I gathered information but couldn't complete the reply. Please rephrase.",
-        tool_calls_made,
-        collected_sources,
-    )
+    raise HTTPException(503, f"HF unavailable: {last_error}")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -365,6 +318,7 @@ def root():
         "default_model": DEFAULT_MODEL,
         "models": list(MODELS.keys()),
         "tools_enabled": ENABLE_TOOLS,
+        "tool_mode": "heuristic",
     }
 
 
@@ -378,7 +332,7 @@ def health():
         "api_key_required": REQUIRE_API_KEY,
         "environment": ENVIRONMENT,
         "tools_enabled": ENABLE_TOOLS,
-        "allowed_origins": ALLOWED_ORIGINS,
+        "tool_mode": "heuristic",
     }
 
 
@@ -410,24 +364,65 @@ def chat(
 ):
     authorized(x_api_key)
     public_name, repo = resolve_model(req.model)
+    system_prompt = MODEL_PROMPTS.get(public_name, SYSTEM_PROMPT)
 
     session_id = req.session_id or str(uuid.uuid4())
     session_key = f"{public_name}:{session_id}"
     history = get_session(session_key)
 
-    reply, tool_count, sources = call_hf_with_tools(
+    user_message = req.message.strip()
+    tool_calls_made = 0
+    sources: list[dict] = []
+
+    # ── Heuristic tool trigger ───────────────────────────────────────────
+    if ENABLE_TOOLS and req.enable_tools and should_use_web(user_message):
+        try:
+            print(f"[tools] Heuristic triggered research for: {user_message[:80]}")
+            result = execute_tool("research", {"query": user_message, "max_pages": 2})
+            tool_calls_made = 1
+
+            if result.get("sources"):
+                sources = result["sources"]
+
+            if result.get("context"):
+                # Inject web context as a system-level note BEFORE user message
+                web_context_note = (
+                    f"[WEB RESEARCH CONTEXT — from live search]\n"
+                    f"Query: {result['query']}\n\n"
+                    f"{result['context']}\n"
+                    f"[END WEB RESEARCH CONTEXT]\n\n"
+                    f"Use the above information to answer accurately. "
+                    f"Cite sources at the end as Markdown links."
+                )
+                # Add as a system-role message just before user
+                history_with_context = [
+                    *history,
+                    {"role": "system", "content": web_context_note},
+                ]
+            else:
+                print(f"[tools] Research returned no context: {result.get('error')}")
+                history_with_context = history
+        except Exception as e:
+            print(f"[tools] Research failed: {e}")
+            history_with_context = history
+    else:
+        history_with_context = history
+
+    # ── Call model (plain, no tools) ─────────────────────────────────────
+    messages = [*history_with_context, {"role": "user", "content": user_message}]
+
+    reply = call_hf_model(
         repo=repo,
-        public_name=public_name,
-        user_message=req.message.strip(),
-        history=history,
+        system_prompt=system_prompt,
+        messages=messages,
         max_new_tokens=req.max_new_tokens,
         temperature=req.temperature,
         top_p=req.top_p,
-        enable_tools=req.enable_tools,
     )
 
+    # ── Update session (without the injected context) ────────────────────
     history.extend([
-        {"role": "user", "content": req.message.strip()},
+        {"role": "user", "content": user_message},
         {"role": "assistant", "content": reply},
     ])
     put_session(session_key, history)
@@ -436,8 +431,8 @@ def chat(
         reply=reply,
         session_id=session_id,
         model=public_name,
-        source="tanzeel+web" if tool_count > 0 else "tanzeel",
-        tool_calls_made=tool_count,
+        source="tanzeel+web" if tool_calls_made > 0 else "tanzeel",
+        tool_calls_made=tool_calls_made,
         sources=sources[:5],
     )
 
