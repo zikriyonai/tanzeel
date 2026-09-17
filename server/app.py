@@ -111,7 +111,7 @@ ALLOWED_ORIGINS = [
 # 🔥 FIXED: Point to the preview model you just uploaded
 # Option 1 — Llama 3.1 8B (Recommended — fast + reliable)
 DEFAULT_MODELS = {
-    "tanzeel-preview": "google/gemma-3-27b-it",   # Google Gemma 3 27B
+    "tanzeel-preview": "sarvamai/sarvam-1",   # Google Gemma 3 27B
 }
 
 
